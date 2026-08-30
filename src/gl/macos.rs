@@ -135,6 +135,14 @@ impl GlContext {
 
     /// Puts the frame on screen.
     ///
+    /// **No `setNeedsDisplay:`.** `flushBuffer` is what presents the frame;
+    /// marking the view dirty on top of it asks AppKit for a display cycle the
+    /// frame does not need. For a plugin this view is a subview of the
+    /// **host's** window, so that is the host's display cycle and its
+    /// CoreAnimation commit, once per frame, on the thread the host also
+    /// delivers input on. `resize` still marks the view, which is the case the
+    /// flag was added for.
+    ///
     /// **On a single-buffered context this is a `glFlush` and costs nothing.**
     /// On a double-buffered one it is a swap, and a swap hands the surface to
     /// the window server — which blocks the calling thread until the server is
@@ -146,7 +154,6 @@ impl GlContext {
     pub fn swap_buffers(&self) {
         unsafe {
             self.context.flushBuffer();
-            let () = msg_send![self.view, setNeedsDisplay: YES];
         }
     }
 
