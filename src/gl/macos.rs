@@ -96,13 +96,26 @@ const GL_RGBA8: u32 = 0x8058;
 /// Drawing into ordinary buffers and blitting into the surface with the
 /// destination's Y reversed does, in one GPU copy of the window.
 struct Surface {
-    io_surface: *mut c_void,
-    io_texture: u32,
-    io_framebuffer: u32,
+    /// **Two of them, shown in turn.** A layer takes a surface by assignment
+    /// to `contents`, and assigning the *same* object again tells
+    /// CoreAnimation that nothing changed — so the screen keeps whatever it
+    /// last composited and only catches up when something else makes the
+    /// window redraw. That is a knob that moves and a picture that does not,
+    /// until the window is dragged. Alternating makes every frame a new value.
+    shown: [Presented; 2],
+    next: std::cell::Cell<usize>,
+    /// What a frame is drawn into before it is copied to a surface.
     colour: u32,
     depth_stencil: u32,
     width: u32,
     height: u32,
+}
+
+/// One `IOSurface`, and the framebuffer that copies a frame into it.
+struct Presented {
+    io_surface: *mut c_void,
+    io_texture: u32,
+    io_framebuffer: u32,
 }
 
 /// An OpenGL context that draws into an `IOSurface`, which a plain `CALayer`
@@ -139,18 +152,10 @@ pub struct GlContext {
     scale: std::cell::Cell<f64>,
 }
 
-impl Surface {
-    /// Makes an `IOSurface` and points a rectangle texture at it.
-    ///
+impl Presented {
     /// **`BGRA` and `GL_TEXTURE_RECTANGLE`** are what `CGLTexImageIOSurface2D`
     /// accepts; neither is a preference.
-    unsafe fn new(cgl: *mut c_void, width: u32, height: u32) -> Result<Surface, GlError> {
-        let width = width.max(1);
-        let height = height.max(1);
-
-        // Built by hand rather than through `NSDictionary`'s variadic
-        // constructor, which this binding types differently from what the keys
-        // need here.
+    unsafe fn new(cgl: *mut c_void, width: u32, height: u32) -> Result<Presented, GlError> {
         let properties: id = msg_send![class!(NSMutableDictionary), dictionary];
         let mut put = |key: &str, value: i64| {
             let key = NSString::alloc(nil).init_str(key);
@@ -201,8 +206,29 @@ impl Surface {
             return Err(GlError::CreationFailed(()));
         }
 
-        // What the frame is actually drawn into. femtovg's `set_screen_target`
-        // requires depth and stencil, and vizia clips with the stencil buffer.
+        Ok(Presented { io_surface, io_texture, io_framebuffer })
+    }
+
+    unsafe fn destroy(&self) {
+        glDeleteFramebuffers(1, &self.io_framebuffer);
+        glDeleteTextures(1, &self.io_texture);
+        let () = msg_send![self.io_surface as id, release];
+    }
+}
+
+impl Surface {
+    /// Makes an `IOSurface` and points a rectangle texture at it.
+    ///
+    /// **`BGRA` and `GL_TEXTURE_RECTANGLE`** are what `CGLTexImageIOSurface2D`
+    /// accepts; neither is a preference.
+    unsafe fn new(cgl: *mut c_void, width: u32, height: u32) -> Result<Surface, GlError> {
+        let width = width.max(1);
+        let height = height.max(1);
+
+        let shown = [Presented::new(cgl, width, height)?, Presented::new(cgl, width, height)?];
+
+        // What a frame is drawn into. femtovg's `set_screen_target` requires
+        // depth and stencil, and vizia clips with the stencil buffer.
         let mut colour = 0;
         glGenRenderbuffers(1, &mut colour);
         glBindRenderbuffer(GL_RENDERBUFFER, colour);
@@ -219,7 +245,13 @@ impl Surface {
         );
         glBindRenderbuffer(GL_RENDERBUFFER, 0);
 
-        Ok(Surface { io_surface, io_texture, io_framebuffer, colour, depth_stencil, width, height })
+        Ok(Surface { shown, next: std::cell::Cell::new(0), colour, depth_stencil, width, height })
+    }
+
+    /// The surface currently on screen, for a caller that has to name one
+    /// without drawing a frame first.
+    fn front(&self) -> *mut c_void {
+        self.shown[1 - self.next.get()].io_surface
     }
 
     unsafe fn attach_to(&self, framebuffer: u32) -> Result<(), GlError> {
@@ -245,9 +277,13 @@ impl Surface {
 
     /// Copies the finished frame into the surface, **turning it over on the
     /// way** — the destination's Y runs from `height` to `0`.
-    unsafe fn publish(&self, framebuffer: u32) {
+    unsafe fn publish(&self, framebuffer: u32) -> *mut c_void {
+        let index = self.next.get();
+        self.next.set(1 - index);
+        let target = &self.shown[index];
+
         glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.io_framebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target.io_framebuffer);
         glBlitFramebuffer(
             0,
             0,
@@ -261,14 +297,15 @@ impl Surface {
             GL_NEAREST,
         );
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        target.io_surface
     }
 
     unsafe fn destroy(&self) {
-        glDeleteFramebuffers(1, &self.io_framebuffer);
-        glDeleteTextures(1, &self.io_texture);
+        for presented in &self.shown {
+            presented.destroy();
+        }
         glDeleteRenderbuffers(1, &self.colour);
         glDeleteRenderbuffers(1, &self.depth_stencil);
-        let () = msg_send![self.io_surface as id, release];
     }
 }
 
@@ -391,7 +428,7 @@ impl GlContext {
 
         let surface = Surface::new(cgl, width, height)?;
         surface.attach_to(framebuffer)?;
-        set_layer_contents(layer, surface.io_surface, scale);
+        set_layer_contents(layer, surface.front(), scale);
 
         NSOpenGLContext::clearCurrentContext(context);
 
@@ -446,10 +483,9 @@ impl GlContext {
             // are cheaper than being wrong.
             self.sync_to_view();
 
-            let surface = self.surface.borrow();
-            surface.publish(self.framebuffer);
+            let showing = self.surface.borrow().publish(self.framebuffer);
             glFlush();
-            set_layer_contents(self.layer, surface.io_surface, self.scale.get());
+            set_layer_contents(self.layer, showing, self.scale.get());
         }
     }
 
@@ -472,7 +508,7 @@ impl GlContext {
         let () = msg_send![self.layer, setFrame: bounds];
 
         if matches {
-            set_layer_contents(self.layer, self.surface.borrow().io_surface, scale);
+            set_layer_contents(self.layer, self.surface.borrow().front(), scale);
             return;
         }
 
@@ -483,7 +519,7 @@ impl GlContext {
             if surface.attach_to(self.framebuffer).is_ok() {
                 let old = self.surface.replace(surface);
                 old.destroy();
-                set_layer_contents(self.layer, self.surface.borrow().io_surface, scale);
+                set_layer_contents(self.layer, self.surface.borrow().front(), scale);
             }
         }
     }
@@ -509,8 +545,14 @@ unsafe fn backing_scale(view: id) -> f64 {
 }
 
 unsafe fn set_layer_contents(layer: id, io_surface: *mut c_void, scale: f64) {
+    // **Committed here, not left to the run loop.** Frames come from a timer
+    // rather than from CoreAnimation's own cycle, so without a transaction of
+    // their own they wait for whatever wakes the window next.
+    let () = msg_send![class!(CATransaction), begin];
+    let () = msg_send![class!(CATransaction), setDisableActions: YES];
     let () = msg_send![layer, setContentsScale: scale];
     let () = msg_send![layer, setContents: io_surface as id];
+    let () = msg_send![class!(CATransaction), commit];
 }
 
 impl Drop for GlContext {
