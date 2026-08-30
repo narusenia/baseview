@@ -125,6 +125,11 @@ pub struct GlContext {
     /// The layer that shows the surface. A sublayer of the caller's own view's
     /// layer, so it draws in the right place and catches no input.
     layer: id,
+    /// The view the layer hangs under. Read for its size and its window's
+    /// scale — **never at creation, which is too early**: the view is not in a
+    /// window yet and reports a scale of 1, so a surface sized then is half the
+    /// size the renderer draws at and the picture comes out magnified.
+    parent_view: id,
     context: id,
     /// The framebuffer the caller draws into. **Its name never changes**, so a
     /// renderer told about it once stays correct across a resize — only the
@@ -392,6 +397,7 @@ impl GlContext {
 
         Ok(GlContext {
             layer,
+            parent_view,
             context,
             framebuffer,
             surface: std::cell::RefCell::new(surface),
@@ -434,6 +440,12 @@ impl GlContext {
     /// worst — on the host's run loop.
     pub fn swap_buffers(&self) {
         unsafe {
+            // **Checked every frame, not remembered.** The window a view will
+            // end up in is not known when the context is made, and it can move
+            // to a screen with a different scale afterwards. Two message sends
+            // are cheaper than being wrong.
+            self.sync_to_view();
+
             let surface = self.surface.borrow();
             surface.publish(self.framebuffer);
             glFlush();
@@ -441,34 +453,47 @@ impl GlContext {
         }
     }
 
+    /// Makes the surface match the view it is shown in, if it does not already.
+    unsafe fn sync_to_view(&self) {
+        let bounds = NSView::bounds(self.parent_view);
+        let scale = backing_scale(self.parent_view);
+        let width = ((bounds.size.width * scale) as u32).max(1);
+        let height = ((bounds.size.height * scale) as u32).max(1);
+
+        let matches = {
+            let surface = self.surface.borrow();
+            surface.width == width && surface.height == height
+        };
+        if matches && (self.scale.get() - scale).abs() < f64::EPSILON {
+            return;
+        }
+
+        self.scale.set(scale);
+        let () = msg_send![self.layer, setFrame: bounds];
+
+        if matches {
+            set_layer_contents(self.layer, self.surface.borrow().io_surface, scale);
+            return;
+        }
+
+        let cgl: *mut c_void = msg_send![self.context, CGLContextObj];
+        if let Ok(surface) = Surface::new(cgl, width, height) {
+            // **The framebuffer name is kept**, only what hangs off it is
+            // replaced — a renderer told about it once stays correct.
+            if surface.attach_to(self.framebuffer).is_ok() {
+                let old = self.surface.replace(surface);
+                old.destroy();
+                set_layer_contents(self.layer, self.surface.borrow().io_surface, scale);
+            }
+        }
+    }
+
     /// The view and its surface follow the window.
     pub(crate) fn resize(&self, size: NSSize) {
         unsafe {
             let () = msg_send![self.layer, setFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)];
-
-
-            let scale = self.scale.get();
-            let width = ((size.width * scale) as u32).max(1);
-            let height = ((size.height * scale) as u32).max(1);
-            let (have_w, have_h) = {
-                let surface = self.surface.borrow();
-                (surface.width, surface.height)
-            };
-            if have_w == width && have_h == height {
-                return;
-            }
-
             self.context.makeCurrentContext();
-            let cgl: *mut c_void = msg_send![self.context, CGLContextObj];
-            if let Ok(surface) = Surface::new(cgl, width, height) {
-                // **The framebuffer name is kept**, only what hangs off it is
-                // replaced — a renderer told about it once stays correct.
-                if surface.attach_to(self.framebuffer).is_ok() {
-                    let old = self.surface.replace(surface);
-                    old.destroy();
-                    set_layer_contents(self.layer, self.surface.borrow().io_surface, scale);
-                }
-            }
+            self.sync_to_view();
             NSOpenGLContext::clearCurrentContext(self.context);
         }
     }
