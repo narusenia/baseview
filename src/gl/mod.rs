@@ -103,6 +103,23 @@ impl GlContext {
         self.context.get_proc_address(symbol)
     }
 
+    /// The framebuffer a caller must render into, if this platform hands one
+    /// out rather than a window-backed default.
+    ///
+    /// macOS returns a framebuffer whose colour attachment is an `IOSurface`
+    /// shown by a plain layer, because an `NSOpenGLView` in a host's window
+    /// spoils that window's compositing for the life of the process. Everywhere
+    /// else this is `None` and the default framebuffer is the window.
+    #[cfg(target_os = "macos")]
+    pub fn framebuffer(&self) -> Option<u32> {
+        Some(self.context.framebuffer())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn framebuffer(&self) -> Option<u32> {
+        None
+    }
+
     pub fn swap_buffers(&self) {
         self.context.swap_buffers();
     }
