@@ -10,7 +10,7 @@ use cocoa::appkit::{
 use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use core_foundation::runloop::{
-    CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext, __CFRunLoopTimer, kCFRunLoopDefaultMode,
+    __CFRunLoopTimer, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
 };
 use keyboard_types::KeyboardEvent;
 
@@ -31,6 +31,22 @@ use super::view::{create_view, BASEVIEW_STATE_IVAR};
 
 #[cfg(feature = "opengl")]
 use crate::gl::{GlConfig, GlContext};
+
+/// How often [`WindowHandler::on_frame`] is called.
+///
+/// **This timer runs on whichever run loop the window was opened on**, and for
+/// an audio plugin that is the host's own — so everything a frame does is time
+/// the host's own interface does not get. The interval was 0.015 s, or 66.7 Hz:
+/// faster than any common display, and faster than anything that feeds it.
+///
+/// **60 Hz, and not lower.** 30 Hz was tried and is wrong for a reason worth
+/// writing down: a plugin's display is fed by its own timer, typically at
+/// 30 Hz, and two free-running 30 Hz timers beat against each other — some
+/// updates land twice in one frame and are drawn once. The result reads as a
+/// meter that stutters, which is what a slow frame timer feels like even
+/// though the numbers are all arriving. **The frame timer has to be faster
+/// than whatever feeds it**, and 60 Hz is the first rate that is.
+const FRAME_INTERVAL_SECONDS: f64 = 1.0 / 60.0;
 
 pub struct WindowHandle {
     state: Rc<WindowState>,
@@ -385,7 +401,14 @@ impl WindowState {
             copyDescription: None,
         };
 
-        let timer = CFRunLoopTimer::new(0.0, 0.015, 0, 0, timer_callback, &mut timer_context);
+        let timer = CFRunLoopTimer::new(
+            0.0,
+            FRAME_INTERVAL_SECONDS,
+            0,
+            0,
+            timer_callback,
+            &mut timer_context,
+        );
 
         CFRunLoop::get_current().add_timer(&timer, kCFRunLoopDefaultMode);
 
