@@ -97,6 +97,20 @@ impl GlContext {
 
         view.setWantsBestResolutionOpenGLSurface_(YES);
 
+        // **Layer-backed on purpose.** An `NSOpenGLView` with no layer of its
+        // own, added into a window that is layer-backed — which every modern
+        // host's is — makes AppKit fall back to a compatibility path for the
+        // **whole window**, and the window does not come back from it: the host
+        // stays sluggish until it is relaunched, long after the plugin has been
+        // removed. Measured in Studio One, whose own interface draws through a
+        // `CAMetalLayer`: with the editor never opened the host is fine, and
+        // one open is enough to degrade it for the life of the process
+        // (`docs/investigations/ui-frame-cost.md` in nxe-plugins).
+        //
+        // Asking for a layer explicitly keeps the surface a layer among layers
+        // instead of the thing that pulls the window off its own path.
+        let () = msg_send![view, setWantsLayer: YES];
+
         let () = msg_send![view, retain];
         NSOpenGLView::display_(view);
         parent_view.addSubview_(view);
