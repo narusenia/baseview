@@ -10,8 +10,8 @@ use cocoa::appkit::{
     NSOpenGLPixelFormat, NSOpenGLProfileVersion3_2Core, NSOpenGLProfileVersion4_1Core,
     NSOpenGLProfileVersionLegacy, NSView,
 };
-use cocoa::base::{id, nil, NO, YES};
-use cocoa::foundation::{NSSize, NSString};
+use cocoa::base::{id, nil, YES};
+use cocoa::foundation::{NSPoint, NSRect, NSSize, NSString};
 
 use core_foundation::base::TCFType;
 use core_foundation::bundle::{CFBundleGetBundleWithIdentifier, CFBundleGetFunctionPointerForName};
@@ -23,9 +23,9 @@ use super::{GlConfig, GlError, Profile};
 
 pub type CreationFailedError = ();
 
-/// The GL names this backend needs. Declared here rather than pulled from a
-/// loader: the OpenGL framework is linked already, and these are the handful of
-/// entry points the surface path uses.
+// The GL names this backend needs. Declared here rather than pulled from a
+// loader: the OpenGL framework is linked already, and these are the handful of
+// entry points the surface path uses.
 #[link(name = "OpenGL", kind = "framework")]
 extern "C" {
     fn glGenFramebuffers(n: i32, ids: *mut u32);
@@ -42,6 +42,11 @@ extern "C" {
     fn glBindRenderbuffer(target: u32, id: u32);
     fn glRenderbufferStorage(target: u32, format: u32, width: i32, height: i32);
     fn glCheckFramebufferStatus(target: u32) -> u32;
+    fn glBlitFramebuffer(
+        sx0: i32, sy0: i32, sx1: i32, sy1: i32,
+        dx0: i32, dy0: i32, dx1: i32, dy1: i32,
+        mask: u32, filter: u32,
+    );
     fn glFlush();
 
     fn CGLTexImageIOSurface2D(
@@ -75,11 +80,26 @@ const GL_RGBA: u32 = 0x1908;
 const GL_BGRA: u32 = 0x80E1;
 const GL_UNSIGNED_INT_8_8_8_8_REV: u32 = 0x8367;
 const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
+const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
+const GL_DRAW_FRAMEBUFFER: u32 = 0x8CA9;
+const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+const GL_NEAREST: u32 = 0x2600;
+const GL_RGBA8: u32 = 0x8058;
 
-/// One `IOSurface`, and the framebuffer that draws into it.
+/// An `IOSurface` to show, and the buffers a frame is built in before it gets
+/// there.
+///
+/// **The frame is not drawn straight into the surface.** OpenGL puts its first
+/// row at the bottom and CoreAnimation reads a surface's first row as the top,
+/// so a frame drawn directly into it arrives upside down — and neither
+/// `geometryFlipped` nor a layer transform turns the *contents* back over.
+/// Drawing into ordinary buffers and blitting into the surface with the
+/// destination's Y reversed does, in one GPU copy of the window.
 struct Surface {
     io_surface: *mut c_void,
-    texture: u32,
+    io_texture: u32,
+    io_framebuffer: u32,
+    colour: u32,
     depth_stencil: u32,
     width: u32,
     height: u32,
@@ -102,9 +122,9 @@ struct Surface {
 /// other layer is. The drawing is unchanged: the caller renders into
 /// [`Self::framebuffer`] exactly as it rendered into the window before.
 pub struct GlContext {
-    /// The view whose layer shows the surface. Owned by the caller's view
-    /// hierarchy; this holds a retain of its own.
-    view: id,
+    /// The layer that shows the surface. A sublayer of the caller's own view's
+    /// layer, so it draws in the right place and catches no input.
+    layer: id,
     context: id,
     /// The framebuffer the caller draws into. **Its name never changes**, so a
     /// renderer told about it once stays correct across a resize — only the
@@ -141,9 +161,9 @@ impl Surface {
             return Err(GlError::CreationFailed(()));
         }
 
-        let mut texture = 0;
-        glGenTextures(1, &mut texture);
-        glBindTexture(GL_TEXTURE_RECTANGLE, texture);
+        let mut io_texture = 0;
+        glGenTextures(1, &mut io_texture);
+        glBindTexture(GL_TEXTURE_RECTANGLE, io_texture);
         glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_RECTANGLE, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         let result = CGLTexImageIOSurface2D(
@@ -162,8 +182,27 @@ impl Surface {
             return Err(GlError::CreationFailed(()));
         }
 
-        // femtovg's `set_screen_target` requires depth and stencil, and vizia
-        // clips with the stencil buffer.
+        let mut io_framebuffer = 0;
+        glGenFramebuffers(1, &mut io_framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, io_framebuffer);
+        glFramebufferTexture2D(
+            GL_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_RECTANGLE,
+            io_texture,
+            0,
+        );
+        if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE {
+            return Err(GlError::CreationFailed(()));
+        }
+
+        // What the frame is actually drawn into. femtovg's `set_screen_target`
+        // requires depth and stencil, and vizia clips with the stencil buffer.
+        let mut colour = 0;
+        glGenRenderbuffers(1, &mut colour);
+        glBindRenderbuffer(GL_RENDERBUFFER, colour);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width as i32, height as i32);
+
         let mut depth_stencil = 0;
         glGenRenderbuffers(1, &mut depth_stencil);
         glBindRenderbuffer(GL_RENDERBUFFER, depth_stencil);
@@ -175,17 +214,16 @@ impl Surface {
         );
         glBindRenderbuffer(GL_RENDERBUFFER, 0);
 
-        Ok(Surface { io_surface, texture, depth_stencil, width, height })
+        Ok(Surface { io_surface, io_texture, io_framebuffer, colour, depth_stencil, width, height })
     }
 
     unsafe fn attach_to(&self, framebuffer: u32) -> Result<(), GlError> {
         glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        glFramebufferTexture2D(
+        glFramebufferRenderbuffer(
             GL_FRAMEBUFFER,
             GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_RECTANGLE,
-            self.texture,
-            0,
+            GL_RENDERBUFFER,
+            self.colour,
         );
         glFramebufferRenderbuffer(
             GL_FRAMEBUFFER,
@@ -200,11 +238,44 @@ impl Surface {
         Ok(())
     }
 
+    /// Copies the finished frame into the surface, **turning it over on the
+    /// way** — the destination's Y runs from `height` to `0`.
+    unsafe fn publish(&self, framebuffer: u32) {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.io_framebuffer);
+        glBlitFramebuffer(
+            0,
+            0,
+            self.width as i32,
+            self.height as i32,
+            0,
+            self.height as i32,
+            self.width as i32,
+            0,
+            GL_COLOR_BUFFER_BIT,
+            GL_NEAREST,
+        );
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    }
+
     unsafe fn destroy(&self) {
-        glDeleteTextures(1, &self.texture);
+        glDeleteFramebuffers(1, &self.io_framebuffer);
+        glDeleteTextures(1, &self.io_texture);
+        glDeleteRenderbuffers(1, &self.colour);
         glDeleteRenderbuffers(1, &self.depth_stencil);
         let () = msg_send![self.io_surface as id, release];
     }
+}
+
+/// An action dictionary that disables every implicit animation.
+unsafe fn null_actions() -> id {
+    let null: id = msg_send![class!(NSNull), null];
+    let actions: id = msg_send![class!(NSMutableDictionary), dictionary];
+    for key in ["contents", "position", "bounds", "frame", "transform"] {
+        let key = NSString::alloc(nil).init_str(key);
+        let () = msg_send![actions, setObject: null forKey: key];
+    }
+    actions
 }
 
 unsafe fn number(value: i64) -> id {
@@ -280,24 +351,28 @@ impl GlContext {
             NSOpenGLContextParameter::NSOpenGLCPSwapInterval,
         );
 
-        // The view that shows the surface: layer-backed, and nothing else.
-        let frame = NSView::frame(parent_view);
-        let view: id = msg_send![class!(NSView), alloc];
-        let view: id = msg_send![view, initWithFrame: frame];
-        if view == nil {
+        // **A layer, not a view.** A view of our own would sit over the
+        // caller's and swallow the mouse; a sublayer draws in the same place
+        // and takes part in no hit testing at all.
+        let frame = NSView::bounds(parent_view);
+        let () = msg_send![parent_view, setWantsLayer: YES];
+        let parent_layer: id = msg_send![parent_view, layer];
+        if parent_layer == nil {
             return Err(GlError::CreationFailed(()));
         }
-        let () = msg_send![view, setWantsLayer: YES];
-        // The surface is drawn with its origin at the bottom, the way OpenGL
-        // leaves it; the layer is told to read it that way rather than the
-        // picture being flipped on the way in.
-        let () = msg_send![view, setLayerContentsPlacement: 0i64];
-        let layer: id = msg_send![view, layer];
-        let () = msg_send![layer, setContentsGravity: NSString::alloc(nil).init_str("bottomLeft")];
-        let () = msg_send![layer, setOpaque: YES];
 
-        let () = msg_send![view, retain];
-        parent_view.addSubview_(view);
+        let layer: id = msg_send![class!(CALayer), layer];
+        let () = msg_send![layer, retain];
+        let () = msg_send![layer, setFrame: frame];
+        let () = msg_send![layer, setOpaque: YES];
+        // **OpenGL writes its first row at the bottom and a layer reads its
+        // first row as the top**, so the picture arrives upside down unless one
+        // of the two is turned over. Turning the layer over is free; flipping
+        // in the renderer would be a transform on every frame.
+        // No implicit animation on `contents`: a new surface every frame would
+        // otherwise cross-fade with the last one.
+        let () = msg_send![layer, setActions: null_actions()];
+        let () = msg_send![parent_layer, addSublayer: layer];
 
         context.makeCurrentContext();
         let cgl: *mut c_void = msg_send![context, CGLContextObj];
@@ -316,7 +391,7 @@ impl GlContext {
         NSOpenGLContext::clearCurrentContext(context);
 
         Ok(GlContext {
-            view,
+            layer,
             context,
             framebuffer,
             surface: std::cell::RefCell::new(surface),
@@ -359,24 +434,27 @@ impl GlContext {
     /// worst — on the host's run loop.
     pub fn swap_buffers(&self) {
         unsafe {
+            let surface = self.surface.borrow();
+            surface.publish(self.framebuffer);
             glFlush();
-            let layer: id = msg_send![self.view, layer];
-            set_layer_contents(layer, self.surface.borrow().io_surface, self.scale.get());
+            set_layer_contents(self.layer, surface.io_surface, self.scale.get());
         }
     }
 
     /// The view and its surface follow the window.
     pub(crate) fn resize(&self, size: NSSize) {
         unsafe {
-            NSView::setFrameSize(self.view, size);
+            let () = msg_send![self.layer, setFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)];
 
-            let parent: id = msg_send![self.view, superview];
-            let scale = if parent == nil { self.scale.get() } else { backing_scale(parent) };
-            self.scale.set(scale);
 
+            let scale = self.scale.get();
             let width = ((size.width * scale) as u32).max(1);
             let height = ((size.height * scale) as u32).max(1);
-            if self.surface.borrow().width == width && self.surface.borrow().height == height {
+            let (have_w, have_h) = {
+                let surface = self.surface.borrow();
+                (surface.width, surface.height)
+            };
+            if have_w == width && have_h == height {
                 return;
             }
 
@@ -388,8 +466,7 @@ impl GlContext {
                 if surface.attach_to(self.framebuffer).is_ok() {
                     let old = self.surface.replace(surface);
                     old.destroy();
-                    let layer: id = msg_send![self.view, layer];
-                    set_layer_contents(layer, self.surface.borrow().io_surface, scale);
+                    set_layer_contents(self.layer, self.surface.borrow().io_surface, scale);
                 }
             }
             NSOpenGLContext::clearCurrentContext(self.context);
@@ -419,9 +496,9 @@ impl Drop for GlContext {
             glDeleteFramebuffers(1, &self.framebuffer);
             NSOpenGLContext::clearCurrentContext(self.context);
 
-            let () = msg_send![self.view, removeFromSuperview];
+            let () = msg_send![self.layer, removeFromSuperlayer];
             let () = msg_send![self.context, release];
-            let () = msg_send![self.view, release];
+            let () = msg_send![self.layer, release];
         }
     }
 }
