@@ -5,10 +5,10 @@ use raw_window_handle::RawWindowHandle;
 
 use cocoa::appkit::{
     NSOpenGLContext, NSOpenGLContextParameter, NSOpenGLPFAAccelerated, NSOpenGLPFAAlphaSize,
-    NSOpenGLPFAColorSize, NSOpenGLPFADepthSize, NSOpenGLPFADoubleBuffer, NSOpenGLPFAMultisample,
-    NSOpenGLPFAOpenGLProfile, NSOpenGLPFASampleBuffers, NSOpenGLPFASamples, NSOpenGLPFAStencilSize,
-    NSOpenGLPixelFormat, NSOpenGLProfileVersion3_2Core, NSOpenGLProfileVersion4_1Core,
-    NSOpenGLProfileVersionLegacy, NSOpenGLView, NSView,
+    NSOpenGLPFABackingStore, NSOpenGLPFAColorSize, NSOpenGLPFADepthSize, NSOpenGLPFADoubleBuffer,
+    NSOpenGLPFAMultisample, NSOpenGLPFAOpenGLProfile, NSOpenGLPFASampleBuffers, NSOpenGLPFASamples,
+    NSOpenGLPFAStencilSize, NSOpenGLPixelFormat, NSOpenGLProfileVersion3_2Core,
+    NSOpenGLProfileVersion4_1Core, NSOpenGLProfileVersionLegacy, NSOpenGLView, NSView,
 };
 use cocoa::base::{id, nil, YES};
 use cocoa::foundation::NSSize;
@@ -72,6 +72,12 @@ impl GlContext {
 
         if config.double_buffer {
             attrs.push(NSOpenGLPFADoubleBuffer as u32);
+            // **The back buffer keeps its contents across a swap.** Without
+            // this, `flushBuffer` may hand back a buffer holding some earlier
+            // frame, and a caller that draws only the part of the window that
+            // changed gets the rest of an old one. Drawing everything every
+            // frame hides that; drawing only what moved does not.
+            attrs.push(NSOpenGLPFABackingStore as u32);
         }
 
         attrs.push(0);
