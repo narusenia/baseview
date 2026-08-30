@@ -414,7 +414,16 @@ impl GlContext {
         // No implicit animation on `contents`: a new surface every frame would
         // otherwise cross-fade with the last one.
         let () = msg_send![layer, setActions: null_actions()];
-        let () = msg_send![parent_layer, addSublayer: layer];
+        // **`NXE_BASEVIEW_NO_PRESENT` leaves the layer out of the window.**
+        // A switch for one question and nothing else: everything below still
+        // happens — the GL context is made, the surfaces exist, every frame is
+        // drawn and copied — but nothing of ours reaches the host's window. If
+        // a host still goes sluggish with this set, then what spoils it is
+        // *having OpenGL in the process*, not what we put on screen.
+        // See `docs/investigations/host-lag.md` in nxe-plugins.
+        if std::env::var_os("NXE_BASEVIEW_NO_PRESENT").is_none() {
+            let () = msg_send![parent_layer, addSublayer: layer];
+        }
 
         context.makeCurrentContext();
         let cgl: *mut c_void = msg_send![context, CGLContextObj];
