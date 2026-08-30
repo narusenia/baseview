@@ -295,7 +295,23 @@ extern "C" fn view_will_move_to_window(this: &Object, _self: Sel, new_window: id
         let tracking_areas: *mut Object = msg_send![this, trackingAreas];
         let tracking_area_count = NSArray::count(tracking_areas);
 
-        let _: () = msg_send![class!(NSEvent), setMouseCoalescingEnabled: NO];
+        // **Mouse coalescing is left alone.**
+        //
+        // This used to be `setMouseCoalescingEnabled: NO`, which is not a
+        // property of this view or even of this window — it is a **class
+        // method on `NSEvent`, and it turns coalescing off for the whole
+        // host process**. Nothing ever turned it back on, so from the moment a
+        // plugin editor was opened the host received every single mouse-moved
+        // event instead of the coalesced ones, for the rest of its life:
+        // its interface stopped tracking the pointer and slid after it, the
+        // plugin could be removed without helping, and only relaunching the
+        // host fixed it. Confirmed in Studio One and, more mildly, in Ableton
+        // Live (`docs/investigations/host-lag.md` in nxe-plugins).
+        //
+        // A tracking area with `NSTrackingMouseMoved` already delivers
+        // `mouseMoved:` to this view, which is what a plugin editor needs;
+        // coalescing only decides how many redundant ones everybody else has
+        // to wade through.
 
         if new_window == nil {
             if tracking_area_count != 0 {
